@@ -10,7 +10,7 @@
 // ----------------------------------------------------------------------------
 #define DISNEY_VID       0x0E6Fu
 #define DISNEY_PID       0x0129u
-#define DISNEY_BCD       0x0112u   // bcdDevice 1.12 (from real hardware)
+#define DISNEY_BCD       0x0112u   // bcdDevice 1.12 in USB BCD (each nibble is one decimal digit: 0x01=1, 0x12→1,2→.12)
 
 // HID interrupt report size (both IN and OUT)
 #define HID_REPORT_SIZE  32
