@@ -50,6 +50,12 @@
 // Set to 0 to silence all UART log output (e.g. for production builds).
 #define LOG_ENABLED      1
 
+// Set to 1 to enable queue/latency diagnostics over UART.
+#ifndef PROXY_ENABLE_DIAGNOSTICS
+#define PROXY_ENABLE_DIAGNOSTICS 0
+#endif
+#define PROXY_DIAG_PRINT_INTERVAL_MS 1000
+
 #define PROXY_REPORT_MAX   64
 #define IN_QUEUE_DEPTH     16
 #define OUT_QUEUE_DEPTH    16
@@ -61,6 +67,9 @@
 typedef struct {
     uint8_t  data[PROXY_REPORT_MAX];
     uint16_t len;
+#if PROXY_ENABLE_DIAGNOSTICS
+    uint32_t enqueued_us;
+#endif
 } in_report_t;
 
 typedef struct {
@@ -68,6 +77,9 @@ typedef struct {
     uint16_t len;
     uint8_t  report_id;
     uint8_t  report_type;
+#if PROXY_ENABLE_DIAGNOSTICS
+    uint32_t enqueued_us;
+#endif
 } out_report_t;
 
 // IN direction: real base -> queue -> Xbox 360
@@ -90,6 +102,20 @@ static out_report_t out_active;
 static bool         out_active_valid = false;
 static bool         out_sending = false;  // true while tuh_hid_set_report is in flight
 static mutex_t      out_mtx;
+
+#if PROXY_ENABLE_DIAGNOSTICS
+static uint32_t in_drop_count = 0;
+static uint32_t out_drop_count = 0;
+static uint32_t in_sent_count = 0;
+static uint32_t out_sent_count = 0;
+static uint32_t in_latency_sum_us = 0;
+static uint32_t out_latency_sum_us = 0;
+static uint32_t in_latency_max_us = 0;
+static uint32_t out_latency_max_us = 0;
+static uint8_t  in_q_peak = 0;
+static uint8_t  out_q_peak = 0;
+static uint32_t diag_last_print_ms = 0;
+#endif
 
 // ----------------------------------------------------------------------------
 // Connection state (each core owns its own flag — no cross-core races)
@@ -126,8 +152,16 @@ static bool in_queue_push_locked(uint8_t const *data, uint16_t len) {
     in_report_t *slot = &in_queue[in_q_tail];
     slot->len = len;
     memcpy(slot->data, data, len);
+#if PROXY_ENABLE_DIAGNOSTICS
+    slot->enqueued_us = to_us_since_boot(get_absolute_time());
+#endif
     in_q_tail = (uint8_t)((in_q_tail + 1) % IN_QUEUE_DEPTH);
     in_q_count++;
+#if PROXY_ENABLE_DIAGNOSTICS
+    if (in_q_count > in_q_peak) {
+        in_q_peak = in_q_count;
+    }
+#endif
     return true;
 }
 
@@ -152,10 +186,53 @@ static bool out_queue_push_locked(uint8_t const *data, uint16_t len, uint8_t rep
     slot->report_id = report_id;
     slot->report_type = report_type;
     memcpy(slot->data, data, len);
+#if PROXY_ENABLE_DIAGNOSTICS
+    slot->enqueued_us = to_us_since_boot(get_absolute_time());
+#endif
     out_q_tail = (uint8_t)((out_q_tail + 1) % OUT_QUEUE_DEPTH);
     out_q_count++;
+#if PROXY_ENABLE_DIAGNOSTICS
+    if (out_q_count > out_q_peak) {
+        out_q_peak = out_q_count;
+    }
+#endif
     return true;
 }
+
+#if PROXY_ENABLE_DIAGNOSTICS
+static void diag_print(void) {
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if ((now_ms - diag_last_print_ms) < PROXY_DIAG_PRINT_INTERVAL_MS) {
+        return;
+    }
+    diag_last_print_ms = now_ms;
+
+    uint8_t in_depth;
+    uint8_t out_depth;
+    bool in_active;
+    bool out_active;
+
+    mutex_enter_blocking(&in_mtx);
+    in_depth = in_q_count;
+    in_active = in_active_valid;
+    mutex_exit(&in_mtx);
+
+    mutex_enter_blocking(&out_mtx);
+    out_depth = out_q_count;
+    out_active = out_active_valid || out_sending;
+    mutex_exit(&out_mtx);
+
+    uint32_t in_avg = in_sent_count ? (in_latency_sum_us / in_sent_count) : 0;
+    uint32_t out_avg = out_sent_count ? (out_latency_sum_us / out_sent_count) : 0;
+
+    printf("[DIAG] IN q=%u peak=%u drop=%lu sent=%lu lat_avg_us=%lu lat_max_us=%lu active=%u\n",
+           in_depth, in_q_peak, (unsigned long)in_drop_count, (unsigned long)in_sent_count,
+           (unsigned long)in_avg, (unsigned long)in_latency_max_us, in_active ? 1u : 0u);
+    printf("[DIAG] OUT q=%u peak=%u drop=%lu sent=%lu lat_avg_us=%lu lat_max_us=%lu active=%u\n",
+           out_depth, out_q_peak, (unsigned long)out_drop_count, (unsigned long)out_sent_count,
+           (unsigned long)out_avg, (unsigned long)out_latency_max_us, out_active ? 1u : 0u);
+}
+#endif
 
 static bool out_queue_pop_locked(out_report_t *out) {
     if (out_q_count == 0) {
@@ -272,6 +349,12 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     }
 #endif
 
+#if PROXY_ENABLE_DIAGNOSTICS
+    if (!queued) {
+        in_drop_count++;
+    }
+#endif
+
     // Re-arm: keep polling the real base.
     tuh_hid_receive_report(dev_addr, instance);
 }
@@ -283,6 +366,15 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
                                      uint16_t len) {
     (void)dev_addr; (void)instance; (void)report_id;
     (void)report_type; (void)len;
+
+#if PROXY_ENABLE_DIAGNOSTICS
+    uint32_t latency_us = to_us_since_boot(get_absolute_time()) - out_active.enqueued_us;
+    out_sent_count++;
+    out_latency_sum_us += latency_us;
+    if (latency_us > out_latency_max_us) {
+        out_latency_max_us = latency_us;
+    }
+#endif
 
     mutex_enter_blocking(&out_mtx);
     out_sending = false;
@@ -352,6 +444,12 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
         printf("[WARN] OUT queue full, dropping report\n");
     }
 #endif
+
+#if PROXY_ENABLE_DIAGNOSTICS
+    if (!queued) {
+        out_drop_count++;
+    }
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -382,6 +480,10 @@ int main(void) {
     while (true) {
         tud_task();
 
+#if PROXY_ENABLE_DIAGNOSTICS
+        diag_print();
+#endif
+
         // Forward any pending IN report to the Xbox 360.
         if (device_mounted && tud_hid_ready()) {
             in_report_t tx;
@@ -400,6 +502,14 @@ int main(void) {
             if (do_send) {
                 // report_id = 0: no report ID prefix in the 32-byte packet
                 if (tud_hid_report(0, tx.data, tx.len)) {
+#if PROXY_ENABLE_DIAGNOSTICS
+                    uint32_t latency_us = to_us_since_boot(get_absolute_time()) - tx.enqueued_us;
+                    in_sent_count++;
+                    in_latency_sum_us += latency_us;
+                    if (latency_us > in_latency_max_us) {
+                        in_latency_max_us = latency_us;
+                    }
+#endif
                     mutex_enter_blocking(&in_mtx);
                     in_active_valid = false;
                     mutex_exit(&in_mtx);

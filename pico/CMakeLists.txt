@@ -30,6 +30,8 @@ project(disney_infinity_proxy C CXX ASM)
 set(CMAKE_C_STANDARD   11)
 set(CMAKE_CXX_STANDARD 17)
 
+option(PROXY_ENABLE_DIAGNOSTICS "Enable USB proxy queue/latency diagnostics" OFF)
+
 pico_sdk_init()
 
 # ─── Pico-PIO-USB ─────────────────────────────────────────────────────────────
@@ -69,6 +71,7 @@ target_link_libraries(disney_infinity_proxy PRIVATE
 target_compile_definitions(disney_infinity_proxy PRIVATE
     BOARD_TUH_RHPORT=1
     PIO_USB_USE_TINYUSB
+    PROXY_ENABLE_DIAGNOSTICS=$<IF:$<BOOL:${PROXY_ENABLE_DIAGNOSTICS}>,1,0>
 )
 
 # Debug output on UART (GP0 TX / GP1 RX).
