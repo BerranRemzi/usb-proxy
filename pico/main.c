@@ -54,12 +54,12 @@
 // ----------------------------------------------------------------------------
 
 // IN direction:  real base → core 1 callback → in_buf → core 0 → Xbox 360
-static uint8_t  in_buf[HID_REPORT_SIZE];
+static uint8_t  in_buf[DISNEY_HID_REPORT_SIZE];
 static bool     in_ready = false;       // protected by in_mtx
 static mutex_t  in_mtx;
 
 // OUT direction: Xbox 360 → core 0 callback → out_buf → core 1 → real base
-static uint8_t  out_buf[HID_REPORT_SIZE];
+static uint8_t  out_buf[DISNEY_HID_REPORT_SIZE];
 static bool     out_ready   = false;    // protected by out_mtx
 static bool     out_sending = false;    // true while tuh_hid_set_report is in flight
 static mutex_t  out_mtx;
@@ -102,7 +102,7 @@ static void core1_main(void) {
     // Configure Pico-PIO-USB as the host controller on rhport 1.
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
     pio_cfg.pin_dp = PIO_USB_DP_PIN;
-    tuh_configure(1, TUH_CFGID_RPI_PIO_USB, &pio_cfg);
+    tuh_configure(1, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
     tuh_init(1);
 
     printf("[HOST] PIO-USB host ready on GP%d/GP%d\n",
@@ -113,12 +113,12 @@ static void core1_main(void) {
 
         // Forward any pending OUT command to the real base.
         if (host_mounted) {
-            uint8_t buf[HID_REPORT_SIZE];
+            uint8_t buf[DISNEY_HID_REPORT_SIZE];
             bool    do_send = false;
 
             mutex_enter_blocking(&out_mtx);
             if (out_ready && !out_sending) {
-                memcpy(buf, out_buf, HID_REPORT_SIZE);
+                memcpy(buf, out_buf, DISNEY_HID_REPORT_SIZE);
                 out_ready   = false;
                 out_sending = true;
                 do_send     = true;
@@ -128,14 +128,14 @@ static void core1_main(void) {
             if (do_send) {
                 bool ok = tuh_hid_set_report(real_dev_addr, real_dev_inst,
                                              0, HID_REPORT_TYPE_OUTPUT,
-                                             buf, HID_REPORT_SIZE);
+                                             buf, DISNEY_HID_REPORT_SIZE);
                 if (!ok) {
                     // Endpoint busy; clear sending flag so we retry next cycle.
                     mutex_enter_blocking(&out_mtx);
                     out_sending = false;
                     mutex_exit(&out_mtx);
                 } else {
-                    log_report("HOST→BASE", buf, HID_REPORT_SIZE);
+                    log_report("HOST→BASE", buf, DISNEY_HID_REPORT_SIZE);
                 }
             }
         }
@@ -177,8 +177,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
 // Invoked when an IN report is received from the real base.
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                   uint8_t const *report, uint16_t len) {
-    if (len > HID_REPORT_SIZE) {
-        len = HID_REPORT_SIZE;
+    if (len > DISNEY_HID_REPORT_SIZE) {
+        len = DISNEY_HID_REPORT_SIZE;
     }
     log_report("BASE→DEV", report, (uint8_t)len);
 
@@ -194,7 +194,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 // Invoked when a SET_REPORT to the real base completes.
 void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
                                      uint8_t report_id,
-                                     hid_report_type_t report_type,
+                                     uint8_t report_type,
                                      uint16_t len) {
     (void)dev_addr; (void)instance; (void)report_id;
     (void)report_type; (void)len;
@@ -234,7 +234,7 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                  uint8_t *buffer, uint16_t reqlen) {
     (void)instance; (void)report_id; (void)report_type;
 
-    uint16_t len = (reqlen < HID_REPORT_SIZE) ? reqlen : HID_REPORT_SIZE;
+    uint16_t len = (reqlen < DISNEY_HID_REPORT_SIZE) ? reqlen : DISNEY_HID_REPORT_SIZE;
 
     mutex_enter_blocking(&in_mtx);
     memcpy(buffer, in_buf, len);
@@ -250,8 +250,8 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                              uint8_t const *buffer, uint16_t bufsize) {
     (void)instance; (void)report_id; (void)report_type;
 
-    if (bufsize > HID_REPORT_SIZE) {
-        bufsize = HID_REPORT_SIZE;
+    if (bufsize > DISNEY_HID_REPORT_SIZE) {
+        bufsize = DISNEY_HID_REPORT_SIZE;
     }
     log_report("XBOX→OUT", buffer, (uint8_t)bufsize);
 
@@ -291,12 +291,12 @@ int main(void) {
 
         // Forward any pending IN report to the Xbox 360.
         if (device_mounted && tud_hid_ready()) {
-            uint8_t buf[HID_REPORT_SIZE];
+            uint8_t buf[DISNEY_HID_REPORT_SIZE];
             bool    do_send = false;
 
             mutex_enter_blocking(&in_mtx);
             if (in_ready) {
-                memcpy(buf, in_buf, HID_REPORT_SIZE);
+                memcpy(buf, in_buf, DISNEY_HID_REPORT_SIZE);
                 in_ready = false;
                 do_send  = true;
             }
@@ -304,8 +304,8 @@ int main(void) {
 
             if (do_send) {
                 // report_id = 0: no report ID prefix in the 32-byte packet
-                tud_hid_report(0, 0, buf, HID_REPORT_SIZE);
-                log_report("DEV →360", buf, HID_REPORT_SIZE);
+                tud_hid_report(0, buf, DISNEY_HID_REPORT_SIZE);
+                log_report("DEV →360", buf, DISNEY_HID_REPORT_SIZE);
             }
         }
     }

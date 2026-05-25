@@ -74,7 +74,7 @@ static const uint8_t desc_configuration[] = {
                              HID_ITF_PROTOCOL_NONE,
                              sizeof(disney_hid_report_descriptor),
                              EP_HID_OUT, EP_HID_IN,
-                             HID_REPORT_SIZE, EP_INTERVAL),
+                             DISNEY_HID_REPORT_SIZE, EP_INTERVAL),
 };
 
 // ----------------------------------------------------------------------------

@@ -1,3 +1,17 @@
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.2.0)
+set(toolchainVersion 14_2_Rel1)
+set(picotoolVersion 2.2.0-a4)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
 cmake_minimum_required(VERSION 3.13)
 
 # ─── Pico SDK ────────────────────────────────────────────────────────────────
@@ -25,7 +39,7 @@ include(FetchContent)
 FetchContent_Declare(
     pico_pio_usb
     GIT_REPOSITORY https://github.com/sekigon-gonnoc/Pico-PIO-USB.git
-    GIT_TAG        0.6.0
+    GIT_TAG        0.7.2
 )
 FetchContent_MakeAvailable(pico_pio_usb)
 
@@ -33,6 +47,7 @@ FetchContent_MakeAvailable(pico_pio_usb)
 add_executable(disney_infinity_proxy
     main.c
     usb_descriptors.c
+    ${PICO_TINYUSB_PATH}/src/portable/raspberrypi/pio_usb/hcd_pio_usb.c
 )
 
 target_include_directories(disney_infinity_proxy PRIVATE
@@ -49,6 +64,11 @@ target_link_libraries(disney_infinity_proxy PRIVATE
     hardware_pio
     hardware_dma
     hardware_clocks
+)
+
+target_compile_definitions(disney_infinity_proxy PRIVATE
+    BOARD_TUH_RHPORT=1
+    PIO_USB_USE_TINYUSB
 )
 
 # Debug output on UART (GP0 TX / GP1 RX).
