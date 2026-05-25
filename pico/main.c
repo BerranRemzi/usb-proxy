@@ -29,6 +29,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -49,20 +50,46 @@
 // Set to 0 to silence all UART log output (e.g. for production builds).
 #define LOG_ENABLED      1
 
+#define PROXY_REPORT_MAX   64
+#define IN_QUEUE_DEPTH     16
+#define OUT_QUEUE_DEPTH    16
+
 // ----------------------------------------------------------------------------
 // Shared report buffers (written by one core, read by the other)
 // ----------------------------------------------------------------------------
 
-// IN direction:  real base → core 1 callback → in_buf → core 0 → Xbox 360
-static uint8_t  in_buf[DISNEY_HID_REPORT_SIZE];
-static bool     in_ready = false;       // protected by in_mtx
-static mutex_t  in_mtx;
+typedef struct {
+    uint8_t  data[PROXY_REPORT_MAX];
+    uint16_t len;
+} in_report_t;
 
-// OUT direction: Xbox 360 → core 0 callback → out_buf → core 1 → real base
-static uint8_t  out_buf[DISNEY_HID_REPORT_SIZE];
-static bool     out_ready   = false;    // protected by out_mtx
-static bool     out_sending = false;    // true while tuh_hid_set_report is in flight
-static mutex_t  out_mtx;
+typedef struct {
+    uint8_t  data[PROXY_REPORT_MAX];
+    uint16_t len;
+    uint8_t  report_id;
+    uint8_t  report_type;
+} out_report_t;
+
+// IN direction: real base -> queue -> Xbox 360
+static in_report_t in_queue[IN_QUEUE_DEPTH];
+static uint8_t     in_q_head = 0;
+static uint8_t     in_q_tail = 0;
+static uint8_t     in_q_count = 0;
+static in_report_t in_active;
+static bool        in_active_valid = false;
+static uint8_t     in_last[PROXY_REPORT_MAX];
+static uint16_t    in_last_len = 0;
+static mutex_t     in_mtx;
+
+// OUT direction: Xbox 360 -> queue -> real base
+static out_report_t out_queue[OUT_QUEUE_DEPTH];
+static uint8_t      out_q_head = 0;
+static uint8_t      out_q_tail = 0;
+static uint8_t      out_q_count = 0;
+static out_report_t out_active;
+static bool         out_active_valid = false;
+static bool         out_sending = false;  // true while tuh_hid_set_report is in flight
+static mutex_t      out_mtx;
 
 // ----------------------------------------------------------------------------
 // Connection state (each core owns its own flag — no cross-core races)
@@ -91,6 +118,56 @@ static void log_report(const char *tag, const uint8_t *buf, uint8_t len) {
 #endif
 }
 
+static bool in_queue_push_locked(uint8_t const *data, uint16_t len) {
+    if (in_q_count >= IN_QUEUE_DEPTH) {
+        return false;
+    }
+
+    in_report_t *slot = &in_queue[in_q_tail];
+    slot->len = len;
+    memcpy(slot->data, data, len);
+    in_q_tail = (uint8_t)((in_q_tail + 1) % IN_QUEUE_DEPTH);
+    in_q_count++;
+    return true;
+}
+
+static bool in_queue_pop_locked(in_report_t *out) {
+    if (in_q_count == 0) {
+        return false;
+    }
+
+    *out = in_queue[in_q_head];
+    in_q_head = (uint8_t)((in_q_head + 1) % IN_QUEUE_DEPTH);
+    in_q_count--;
+    return true;
+}
+
+static bool out_queue_push_locked(uint8_t const *data, uint16_t len, uint8_t report_id, uint8_t report_type) {
+    if (out_q_count >= OUT_QUEUE_DEPTH) {
+        return false;
+    }
+
+    out_report_t *slot = &out_queue[out_q_tail];
+    slot->len = len;
+    slot->report_id = report_id;
+    slot->report_type = report_type;
+    memcpy(slot->data, data, len);
+    out_q_tail = (uint8_t)((out_q_tail + 1) % OUT_QUEUE_DEPTH);
+    out_q_count++;
+    return true;
+}
+
+static bool out_queue_pop_locked(out_report_t *out) {
+    if (out_q_count == 0) {
+        return false;
+    }
+
+    *out = out_queue[out_q_head];
+    out_q_head = (uint8_t)((out_q_head + 1) % OUT_QUEUE_DEPTH);
+    out_q_count--;
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // Core 1 — USB host task (Pico-PIO-USB)
 // ----------------------------------------------------------------------------
@@ -113,29 +190,30 @@ static void core1_main(void) {
 
         // Forward any pending OUT command to the real base.
         if (host_mounted) {
-            uint8_t buf[DISNEY_HID_REPORT_SIZE];
-            bool    do_send = false;
+            out_report_t tx;
+            bool         do_send = false;
 
             mutex_enter_blocking(&out_mtx);
-            if (out_ready && !out_sending) {
-                memcpy(buf, out_buf, DISNEY_HID_REPORT_SIZE);
-                out_ready   = false;
-                out_sending = true;
-                do_send     = true;
+            if (!out_active_valid) {
+                out_active_valid = out_queue_pop_locked(&out_active);
+            }
+            if (out_active_valid && !out_sending) {
+                tx = out_active;
+                do_send = true;
             }
             mutex_exit(&out_mtx);
 
             if (do_send) {
                 bool ok = tuh_hid_set_report(real_dev_addr, real_dev_inst,
-                                             0, HID_REPORT_TYPE_OUTPUT,
-                                             buf, DISNEY_HID_REPORT_SIZE);
+                                             tx.report_id, tx.report_type,
+                                             tx.data, tx.len);
                 if (!ok) {
-                    // Endpoint busy; clear sending flag so we retry next cycle.
-                    mutex_enter_blocking(&out_mtx);
-                    out_sending = false;
-                    mutex_exit(&out_mtx);
+                    // Keep out_active intact; retry on next loop.
                 } else {
-                    log_report("HOST→BASE", buf, DISNEY_HID_REPORT_SIZE);
+                    mutex_enter_blocking(&out_mtx);
+                    out_sending = true;
+                    mutex_exit(&out_mtx);
+                    log_report("HOST→BASE", tx.data, (uint8_t)tx.len);
                 }
             }
         }
@@ -177,15 +255,22 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
 // Invoked when an IN report is received from the real base.
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                   uint8_t const *report, uint16_t len) {
-    if (len > DISNEY_HID_REPORT_SIZE) {
-        len = DISNEY_HID_REPORT_SIZE;
+    if (len > PROXY_REPORT_MAX) {
+        len = PROXY_REPORT_MAX;
     }
     log_report("BASE→DEV", report, (uint8_t)len);
 
     mutex_enter_blocking(&in_mtx);
-    memcpy(in_buf, report, len);
-    in_ready = true;
+    memcpy(in_last, report, len);
+    in_last_len = len;
+    bool queued = in_queue_push_locked(report, len);
     mutex_exit(&in_mtx);
+
+#if LOG_ENABLED
+    if (!queued) {
+        printf("[WARN] IN queue full, dropping report\n");
+    }
+#endif
 
     // Re-arm: keep polling the real base.
     tuh_hid_receive_report(dev_addr, instance);
@@ -201,6 +286,7 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
 
     mutex_enter_blocking(&out_mtx);
     out_sending = false;
+    out_active_valid = false;
     mutex_exit(&out_mtx);
 }
 
@@ -234,10 +320,12 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                  uint8_t *buffer, uint16_t reqlen) {
     (void)instance; (void)report_id; (void)report_type;
 
-    uint16_t len = (reqlen < DISNEY_HID_REPORT_SIZE) ? reqlen : DISNEY_HID_REPORT_SIZE;
-
     mutex_enter_blocking(&in_mtx);
-    memcpy(buffer, in_buf, len);
+    uint16_t len = in_last_len;
+    if (len > reqlen) {
+        len = reqlen;
+    }
+    memcpy(buffer, in_last, len);
     mutex_exit(&in_mtx);
 
     return len;
@@ -248,17 +336,22 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                              hid_report_type_t report_type,
                              uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance; (void)report_id; (void)report_type;
+    (void)instance;
 
-    if (bufsize > DISNEY_HID_REPORT_SIZE) {
-        bufsize = DISNEY_HID_REPORT_SIZE;
+    if (bufsize > PROXY_REPORT_MAX) {
+        bufsize = PROXY_REPORT_MAX;
     }
     log_report("XBOX→OUT", buffer, (uint8_t)bufsize);
 
     mutex_enter_blocking(&out_mtx);
-    memcpy(out_buf, buffer, bufsize);
-    out_ready = true;
+    bool queued = out_queue_push_locked(buffer, bufsize, report_id, (uint8_t)report_type);
     mutex_exit(&out_mtx);
+
+#if LOG_ENABLED
+    if (!queued) {
+        printf("[WARN] OUT queue full, dropping report\n");
+    }
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -291,21 +384,27 @@ int main(void) {
 
         // Forward any pending IN report to the Xbox 360.
         if (device_mounted && tud_hid_ready()) {
-            uint8_t buf[DISNEY_HID_REPORT_SIZE];
-            bool    do_send = false;
+            in_report_t tx;
+            bool        do_send = false;
 
             mutex_enter_blocking(&in_mtx);
-            if (in_ready) {
-                memcpy(buf, in_buf, DISNEY_HID_REPORT_SIZE);
-                in_ready = false;
-                do_send  = true;
+            if (!in_active_valid) {
+                in_active_valid = in_queue_pop_locked(&in_active);
+            }
+            if (in_active_valid) {
+                tx = in_active;
+                do_send = true;
             }
             mutex_exit(&in_mtx);
 
             if (do_send) {
                 // report_id = 0: no report ID prefix in the 32-byte packet
-                tud_hid_report(0, buf, DISNEY_HID_REPORT_SIZE);
-                log_report("DEV →360", buf, DISNEY_HID_REPORT_SIZE);
+                if (tud_hid_report(0, tx.data, tx.len)) {
+                    mutex_enter_blocking(&in_mtx);
+                    in_active_valid = false;
+                    mutex_exit(&in_mtx);
+                    log_report("DEV →360", tx.data, (uint8_t)tx.len);
+                }
             }
         }
     }
