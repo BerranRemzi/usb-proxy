@@ -127,21 +127,64 @@ static volatile bool host_mounted   = false;  // real base connected (core 1)
 // Identity of the real base on the host side
 static uint8_t real_dev_addr = 0xFFu;
 static uint8_t real_dev_inst = 0xFFu;
+static volatile uint16_t mirrored_vid = 0;
+static volatile uint16_t mirrored_pid = 0;
+static volatile bool     mirrored_vid_pid_ready = false;
+
+typedef enum {
+    PROXY_DIR_BASE_TO_XBOX,
+    PROXY_DIR_XBOX_TO_BASE,
+} proxy_direction_t;
 
 // ----------------------------------------------------------------------------
 // Logging helpers
 // ----------------------------------------------------------------------------
 
-static void log_report(const char *tag, const uint8_t *buf, uint8_t len) {
+static const char *packet_name_for_direction(proxy_direction_t direction, uint8_t packet_type) {
+    switch (packet_type) {
+        case 0x01:
+            return direction == PROXY_DIR_XBOX_TO_BASE ? "activate" : "status";
+        case 0x0B:
+            return "figure_event";
+        case 0x83:
+            return "set_led";
+        case 0xB4:
+            return direction == PROXY_DIR_XBOX_TO_BASE ? "read_figure" : "read_response";
+        case 0xB5:
+            return "write_figure";
+        default:
+            return "unknown";
+    }
+}
+
+static void log_disney_report(const char *tag, proxy_direction_t direction,
+                              const uint8_t *buf, uint16_t len) {
 #if LOG_ENABLED
-    printf("[%s]", tag);
-    for (uint8_t i = 0; i < len; i++) {
+    const char *packet_name = (len > 0)
+        ? packet_name_for_direction(direction, buf[0])
+        : "empty";
+
+    printf("[%s:%s]", tag, packet_name);
+    for (uint16_t i = 0; i < len; i++) {
         printf(" %02X", buf[i]);
     }
     printf("\n");
 #else
-    (void)tag; (void)buf; (void)len;
+    (void)tag; (void)direction; (void)buf; (void)len;
 #endif
+}
+
+static void transform_base_to_xbox_report(uint8_t *data, uint16_t *len) {
+    (void)data;
+    (void)len;
+}
+
+static void transform_xbox_to_base_report(uint8_t *data, uint16_t *len,
+                                          uint8_t *report_id, uint8_t *report_type) {
+    (void)data;
+    (void)len;
+    (void)report_id;
+    (void)report_type;
 }
 
 static bool in_queue_push_locked(uint8_t const *data, uint16_t len) {
@@ -290,7 +333,7 @@ static void core1_main(void) {
                     mutex_enter_blocking(&out_mtx);
                     out_sending = true;
                     mutex_exit(&out_mtx);
-                    log_report("HOST→BASE", tx.data, (uint8_t)tx.len);
+                    log_disney_report("HOST->BASE", PROXY_DIR_XBOX_TO_BASE, tx.data, tx.len);
                 }
             }
         }
@@ -310,6 +353,13 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
     tuh_vid_pid_get(dev_addr, &vid, &pid);
     printf("[HOST] Device mounted — addr=%u inst=%u  VID:PID=%04X:%04X\n",
            dev_addr, instance, vid, pid);
+
+    if (!mirrored_vid_pid_ready) {
+        mirrored_vid = vid;
+        mirrored_pid = pid;
+        mirrored_vid_pid_ready = true;
+        printf("[DEV ] Mirroring VID:PID = %04X:%04X\n", vid, pid);
+    }
 
     real_dev_addr = dev_addr;
     real_dev_inst = instance;
@@ -332,15 +382,22 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
 // Invoked when an IN report is received from the real base.
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                   uint8_t const *report, uint16_t len) {
+    (void)dev_addr;
+    (void)instance;
+
     if (len > PROXY_REPORT_MAX) {
         len = PROXY_REPORT_MAX;
     }
-    log_report("BASE→DEV", report, (uint8_t)len);
+
+    uint8_t transformed[PROXY_REPORT_MAX];
+    memcpy(transformed, report, len);
+    transform_base_to_xbox_report(transformed, &len);
+    log_disney_report("BASE->DEV", PROXY_DIR_BASE_TO_XBOX, transformed, len);
 
     mutex_enter_blocking(&in_mtx);
-    memcpy(in_last, report, len);
+    memcpy(in_last, transformed, len);
     in_last_len = len;
-    bool queued = in_queue_push_locked(report, len);
+    bool queued = in_queue_push_locked(transformed, len);
     mutex_exit(&in_mtx);
 
 #if LOG_ENABLED
@@ -433,10 +490,18 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     if (bufsize > PROXY_REPORT_MAX) {
         bufsize = PROXY_REPORT_MAX;
     }
-    log_report("XBOX→OUT", buffer, (uint8_t)bufsize);
+
+    uint8_t transformed[PROXY_REPORT_MAX];
+    memcpy(transformed, buffer, bufsize);
+    uint8_t mutable_report_id = report_id;
+    uint8_t mutable_report_type = (uint8_t)report_type;
+    transform_xbox_to_base_report(transformed, &bufsize,
+                                  &mutable_report_id, &mutable_report_type);
+    log_disney_report("XBOX->OUT", PROXY_DIR_XBOX_TO_BASE, transformed, bufsize);
 
     mutex_enter_blocking(&out_mtx);
-    bool queued = out_queue_push_locked(buffer, bufsize, report_id, (uint8_t)report_type);
+    bool queued = out_queue_push_locked(transformed, bufsize,
+                                        mutable_report_id, mutable_report_type);
     mutex_exit(&out_mtx);
 
 #if LOG_ENABLED
@@ -472,6 +537,13 @@ int main(void) {
     // Start core 1 (USB host) before core 0 initialises the device stack so
     // the PIO programs load before TinyUSB allocates DMA channels.
     multicore_launch_core1(core1_main);
+
+    printf("[DEV ] Waiting for upstream HID VID:PID before USB device init...\n");
+    while (!mirrored_vid_pid_ready) {
+        sleep_ms(1);
+    }
+
+    usb_proxy_set_vid_pid((uint16_t)mirrored_vid, (uint16_t)mirrored_pid);
 
     // Initialise TinyUSB device stack on rhport 0 (native USB hardware).
     tud_init(0);
@@ -513,7 +585,7 @@ int main(void) {
                     mutex_enter_blocking(&in_mtx);
                     in_active_valid = false;
                     mutex_exit(&in_mtx);
-                    log_report("DEV →360", tx.data, (uint8_t)tx.len);
+                    log_disney_report("DEV->360", PROXY_DIR_BASE_TO_XBOX, tx.data, tx.len);
                 }
             }
         }

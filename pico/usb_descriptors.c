@@ -29,9 +29,9 @@ const uint16_t disney_hid_report_descriptor_len =
 
 // ----------------------------------------------------------------------------
 // Device Descriptor
-// Mirrors the real Disney Infinity base exactly so the Xbox 360 accepts it.
+// VID/PID are configured at runtime from the upstream host-side device.
 // ----------------------------------------------------------------------------
-static const tusb_desc_device_t desc_device = {
+static tusb_desc_device_t desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
@@ -39,14 +39,19 @@ static const tusb_desc_device_t desc_device = {
     .bDeviceSubClass    = 0x00,
     .bDeviceProtocol    = 0x00,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
-    .idVendor           = DISNEY_VID,
-    .idProduct          = DISNEY_PID,
+    .idVendor           = 0x0000,
+    .idProduct          = 0x0000,
     .bcdDevice          = DISNEY_BCD,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x00,
     .bNumConfigurations = 0x01,
 };
+
+void usb_proxy_set_vid_pid(uint16_t vid, uint16_t pid) {
+    desc_device.idVendor = vid;
+    desc_device.idProduct = pid;
+}
 
 // ----------------------------------------------------------------------------
 // Configuration Descriptor
