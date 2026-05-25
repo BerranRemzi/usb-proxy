@@ -59,6 +59,8 @@
 #define PROXY_REPORT_MAX   64
 #define IN_QUEUE_DEPTH     16
 #define OUT_QUEUE_DEPTH    16
+#define XSM3_CONTROL_MAX   64
+#define XSM3_CONTROL_TIMEOUT_MS 250
 
 // ----------------------------------------------------------------------------
 // Shared report buffers (written by one core, read by the other)
@@ -102,6 +104,23 @@ static out_report_t out_active;
 static bool         out_active_valid = false;
 static bool         out_sending = false;  // true while tuh_hid_set_report is in flight
 static mutex_t      out_mtx;
+
+typedef struct {
+    tusb_control_request_t setup;
+    uint8_t               buffer[XSM3_CONTROL_MAX];
+    uint16_t              actual_len;
+    bool                  pending;
+    bool                  in_flight;
+    bool                  done;
+    bool                  success;
+} xsm3_control_state_t;
+
+static xsm3_control_state_t xsm3_control;
+static tuh_xfer_t           xsm3_host_xfer;
+static tusb_control_request_t xsm3_out_request;
+static uint8_t             xsm3_out_buffer[XSM3_CONTROL_MAX];
+static bool                xsm3_out_request_valid = false;
+static mutex_t             xsm3_mtx;
 
 #if PROXY_ENABLE_DIAGNOSTICS
 static uint32_t in_drop_count = 0;
@@ -154,6 +173,143 @@ static const char *packet_name_for_direction(proxy_direction_t direction, uint8_
             return "write_figure";
         default:
             return "unknown";
+    }
+}
+
+static bool xsm3_is_supported_request(tusb_control_request_t const *request) {
+    if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR) {
+        return false;
+    }
+
+    if (request->wIndex != 0x0103u) {
+        return false;
+    }
+
+    switch (request->bRequest) {
+        case 0x81:
+            return request->bmRequestType == 0xC1u && request->wValue == 0x5B17u && request->wLength == 0x001Du;
+        case 0x82:
+            return request->bmRequestType == 0x41u && request->wValue == 0x0003u && request->wLength == 0x0022u;
+        case 0x83:
+            return request->bmRequestType == 0xC1u &&
+                   (request->wValue == 0x5C28u || request->wValue == 0x5C10u) &&
+                   (request->wLength == 0x002Eu || request->wLength == 0x0016u);
+        case 0x87:
+            return request->bmRequestType == 0x41u && request->wValue == 0x0003u && request->wLength == 0x0016u;
+        default:
+            return false;
+    }
+}
+
+static void log_xsm3_request(const char *tag, tusb_control_request_t const *request) {
+#if LOG_ENABLED
+    printf("[%s] bm=%02X b=%02X wValue=%04X wIndex=%04X wLength=%u\n",
+           tag,
+           request->bmRequestType,
+           request->bRequest,
+           request->wValue,
+           request->wIndex,
+           request->wLength);
+#else
+    (void)tag;
+    (void)request;
+#endif
+}
+
+static void xsm3_host_control_complete_cb(tuh_xfer_t *xfer) {
+    mutex_enter_blocking(&xsm3_mtx);
+    xsm3_control.actual_len = (uint16_t)xfer->actual_len;
+    xsm3_control.success = (xfer->result == XFER_RESULT_SUCCESS);
+    xsm3_control.done = true;
+    xsm3_control.pending = false;
+    xsm3_control.in_flight = false;
+    mutex_exit(&xsm3_mtx);
+}
+
+static bool xsm3_submit_request_and_wait(tusb_control_request_t const *request,
+                                         uint8_t const *payload, uint16_t payload_len,
+                                         uint16_t *actual_len) {
+    if (!host_mounted || real_dev_addr == 0xFFu) {
+        return false;
+    }
+
+    if (payload_len > XSM3_CONTROL_MAX) {
+        return false;
+    }
+
+    mutex_enter_blocking(&xsm3_mtx);
+    if (xsm3_control.pending || xsm3_control.in_flight) {
+        mutex_exit(&xsm3_mtx);
+        return false;
+    }
+
+    xsm3_control.setup = *request;
+    xsm3_control.actual_len = 0;
+    xsm3_control.pending = true;
+    xsm3_control.in_flight = false;
+    xsm3_control.done = false;
+    xsm3_control.success = false;
+    if (payload_len > 0 && payload != NULL) {
+        memcpy(xsm3_control.buffer, payload, payload_len);
+    }
+    mutex_exit(&xsm3_mtx);
+
+    absolute_time_t deadline = make_timeout_time_ms(XSM3_CONTROL_TIMEOUT_MS);
+    while (!time_reached(deadline)) {
+        bool done;
+        bool success;
+        uint16_t len;
+
+        mutex_enter_blocking(&xsm3_mtx);
+        done = xsm3_control.done;
+        success = xsm3_control.success;
+        len = xsm3_control.actual_len;
+        mutex_exit(&xsm3_mtx);
+
+        if (done) {
+            if (actual_len != NULL) {
+                *actual_len = len;
+            }
+            return success;
+        }
+
+        tight_loop_contents();
+    }
+
+    mutex_enter_blocking(&xsm3_mtx);
+    xsm3_control.pending = false;
+    xsm3_control.in_flight = false;
+    xsm3_control.done = true;
+    xsm3_control.success = false;
+    mutex_exit(&xsm3_mtx);
+    return false;
+}
+
+static void xsm3_host_task(void) {
+    bool submit = false;
+
+    mutex_enter_blocking(&xsm3_mtx);
+    if (xsm3_control.pending && !xsm3_control.in_flight) {
+        xsm3_host_xfer.daddr = real_dev_addr;
+        xsm3_host_xfer.ep_addr = 0x00u;
+        xsm3_host_xfer.result = XFER_RESULT_INVALID;
+        xsm3_host_xfer.actual_len = 0;
+        xsm3_host_xfer.setup = &xsm3_control.setup;
+        xsm3_host_xfer.buffer = xsm3_control.buffer;
+        xsm3_host_xfer.complete_cb = xsm3_host_control_complete_cb;
+        xsm3_host_xfer.user_data = 0;
+        xsm3_control.in_flight = true;
+        submit = true;
+    }
+    mutex_exit(&xsm3_mtx);
+
+    if (submit && !tuh_control_xfer(&xsm3_host_xfer)) {
+        mutex_enter_blocking(&xsm3_mtx);
+        xsm3_control.pending = false;
+        xsm3_control.in_flight = false;
+        xsm3_control.done = true;
+        xsm3_control.success = false;
+        mutex_exit(&xsm3_mtx);
     }
 }
 
@@ -307,6 +463,7 @@ static void core1_main(void) {
 
     while (true) {
         tuh_task();
+        xsm3_host_task();
 
         // Forward any pending OUT command to the real base.
         if (host_mounted) {
@@ -376,6 +533,11 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
         host_mounted   = false;
         real_dev_addr  = 0xFFu;
         real_dev_inst  = 0xFFu;
+
+        mutex_enter_blocking(&xsm3_mtx);
+        memset(&xsm3_control, 0, sizeof(xsm3_control));
+        xsm3_out_request_valid = false;
+        mutex_exit(&xsm3_mtx);
     }
 }
 
@@ -462,6 +624,53 @@ void tud_suspend_cb(bool remote_wakeup_en) {
 void tud_resume_cb(void) {
 }
 
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                tusb_control_request_t const *request) {
+    if (!xsm3_is_supported_request(request)) {
+        return false;
+    }
+
+    if (stage == CONTROL_STAGE_SETUP) {
+        log_xsm3_request("XSM3 SETUP", request);
+
+        if (request->bmRequestType_bit.direction == TUSB_DIR_IN) {
+            uint16_t actual_len = 0;
+            if (!xsm3_submit_request_and_wait(request, NULL, 0, &actual_len)) {
+                return false;
+            }
+
+            if (actual_len > request->wLength) {
+                actual_len = request->wLength;
+            }
+
+            return tud_control_xfer(rhport, request, xsm3_control.buffer, actual_len);
+        }
+
+        xsm3_out_request = *request;
+        xsm3_out_request_valid = true;
+        return tud_control_xfer(rhport, request, xsm3_out_buffer, request->wLength);
+    }
+
+    if (stage == CONTROL_STAGE_DATA) {
+        if (request->bmRequestType_bit.direction == TUSB_DIR_OUT && xsm3_out_request_valid) {
+            return xsm3_submit_request_and_wait(&xsm3_out_request,
+                                                xsm3_out_buffer,
+                                                xsm3_out_request.wLength,
+                                                NULL);
+        }
+        return true;
+    }
+
+    if (stage == CONTROL_STAGE_ACK) {
+        if (request->bmRequestType_bit.direction == TUSB_DIR_OUT) {
+            xsm3_out_request_valid = false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 // Invoked when the Xbox 360 issues a GET_REPORT control request.
 // Return the most recent IN report received from the real base.
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
@@ -533,6 +742,7 @@ int main(void) {
 
     mutex_init(&in_mtx);
     mutex_init(&out_mtx);
+    mutex_init(&xsm3_mtx);
 
     // Start core 1 (USB host) before core 0 initialises the device stack so
     // the PIO programs load before TinyUSB allocates DMA channels.
