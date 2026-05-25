@@ -45,10 +45,10 @@
 // ----------------------------------------------------------------------------
 
 // PIO-USB D+ pin. D− is automatically assigned to PIO_USB_DP_PIN + 1.
-#define PIO_USB_DP_PIN   2
+#define PIO_USB_DP_PIN   0
 
 // Set to 0 to silence all UART log output (e.g. for production builds).
-#define LOG_ENABLED      1
+#define LOG_ENABLED      0
 
 // Set to 1 to enable queue/latency diagnostics over UART.
 #ifndef PROXY_ENABLE_DIAGNOSTICS
@@ -734,6 +734,13 @@ int main(void) {
     // PIO-USB requires 120 MHz for correct Full Speed (12 Mbps) timing.
     set_sys_clock_khz(120000, true);
 
+    #define VBUS_CTRL_PIN  15
+    // Turn on VBUS for the host port BEFORE starting the USB stack
+    gpio_init(VBUS_CTRL_PIN);
+    sleep_ms(100);
+    gpio_set_dir(VBUS_CTRL_PIN, GPIO_OUT);
+    gpio_put(VBUS_CTRL_PIN, false); // Active low
+    
     stdio_init_all();   // UART only (USB CDC disabled in CMakeLists)
     printf("\n=== Disney Infinity RP2040 USB Proxy ===\n");
     printf("    PIO-USB host: GP%d (D+) / GP%d (D-)\n",
